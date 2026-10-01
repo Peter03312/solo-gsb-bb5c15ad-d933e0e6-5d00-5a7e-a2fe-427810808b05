@@ -2,10 +2,21 @@
 // 调用方据此整体回滚，绝不写入部分数据。
 
 export class ValidationError extends Error {
-  constructor(errors) {
+  constructor(errors, detail = null) {
     super(Array.isArray(errors) ? errors.join('；') : errors);
     this.errors = Array.isArray(errors) ? errors : [errors];
     this.status = 400;
+    this.detail = detail;
+  }
+}
+
+// 409：状态冲突（核验草稿已存在 / 版本过期 / 记录已冻结等）
+export class ConflictError extends Error {
+  constructor(errors, extra = {}) {
+    super(Array.isArray(errors) ? errors.join('；') : errors);
+    this.errors = Array.isArray(errors) ? errors : [errors];
+    this.status = 409;
+    Object.assign(this, extra);
   }
 }
 

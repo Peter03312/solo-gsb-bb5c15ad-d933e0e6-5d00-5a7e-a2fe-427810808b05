@@ -245,3 +245,15 @@ pre {
   font-size: 12px;
   overflow-x: auto;
 }
+
+/* 现场核验 */
+.ver-table td input[type="text"],
+.ver-table td input[type="number"] { min-width: 130px; }
+tr.row-bad { background: var(--bad-bg); }
+.inp-bad {
+  border-color: var(--bad) !important;
+  outline: 2px solid rgba(198, 40, 40, 0.25);
+}
+#ver-dialog { width: min(960px, 94vw); }
+#ver-detail { padding: 16px 20px; overflow-y: auto; max-height: calc(88vh - 60px); }
+.ver-table ul { margin: 4px 0; padding-left: 18px; }

@@ -63,6 +63,24 @@ CREATE TABLE IF NOT EXISTS publications (
   result_json TEXT NOT NULL,
   reasons TEXT
 );
+
+-- 现场装载核验：一条发布记录至多一份（草稿或完成），UNIQUE 约束兜底。
+-- version 为乐观锁：每次暂存自增，更新须携带旧版本以防覆盖他人修改。
+-- 完成后 completed_at 置位、result_json 冻结，之后草稿与完成结果均不可改写。
+CREATE TABLE IF NOT EXISTS verifications (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  publication_id INTEGER NOT NULL UNIQUE,
+  version INTEGER NOT NULL DEFAULT 1,
+  entries_json TEXT NOT NULL,
+  completed_at TEXT,
+  result_json TEXT,
+  checks_json TEXT,
+  diff_sum REAL,
+  mass_sum REAL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  FOREIGN KEY (publication_id) REFERENCES publications(id)
+);
 `;
 
 // ---------- 读取 ----------
@@ -189,4 +207,67 @@ export function insertPublication(
       JSON.stringify(reasons ?? []),
     );
   return info.lastInsertRowid;
+}
+
+// ---------- 现场核验 ----------
+
+export function getVerificationRow(db, id) {
+  return db.prepare('SELECT * FROM verifications WHERE id = ?').get(id);
+}
+
+export function getVerificationRowByPublication(db, publicationId) {
+  return db
+    .prepare('SELECT * FROM verifications WHERE publication_id = ?')
+    .get(publicationId);
+}
+
+export function createVerification(db, publicationId, entries) {
+  const info = db
+    .prepare(
+      `INSERT INTO verifications (publication_id, version, entries_json)
+       VALUES (?, 1, ?)`,
+    )
+    .run(publicationId, JSON.stringify(entries));
+  return getVerificationRow(db, info.lastInsertRowid);
+}
+
+// 乐观锁更新：仅当草稿未完成且 version 匹配时写入；返回 null 表示未命中。
+export function updateVerificationEntries(db, id, expectedVersion, entries) {
+  const info = db
+    .prepare(
+      `UPDATE verifications
+         SET entries_json = ?, version = version + 1, updated_at = datetime('now')
+       WHERE id = ? AND version = ? AND completed_at IS NULL`,
+    )
+    .run(JSON.stringify(entries), id, expectedVersion);
+  return info.changes === 1 ? getVerificationRow(db, id) : null;
+}
+
+// 完成：冻结判定结果（同一事务内由 server 重读快照并判定后调用）。
+export function completeVerification(db, id, { checks, diffSum, massSum }) {
+  const info = db
+    .prepare(
+      `UPDATE verifications
+         SET completed_at = datetime('now'),
+             result_json = entries_json,
+             checks_json = ?,
+             diff_sum = ?,
+             mass_sum = ?,
+             updated_at = datetime('now')
+       WHERE id = ? AND completed_at IS NULL`,
+    )
+    .run(JSON.stringify(checks), diffSum, massSum, id);
+  return info.changes === 1 ? getVerificationRow(db, id) : null;
+}
+
+// 核验列表（连发布表取冻结依据与发布编号）
+export function listVerificationRows(db) {
+  return db
+    .prepare(
+      `SELECT v.*, p.basis_hash AS pub_basis_hash, p.feasible AS pub_feasible
+         FROM verifications v
+         JOIN publications p ON p.id = v.publication_id
+        ORDER BY v.id DESC`,
+    )
+    .all();
 }
