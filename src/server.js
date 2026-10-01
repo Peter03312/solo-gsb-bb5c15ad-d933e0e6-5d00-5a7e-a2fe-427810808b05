@@ -14,6 +14,11 @@ import {
   listPublications,
   getPublication,
   insertPublication,
+  listVerifications,
+  getVerificationByPublication,
+  insertVerification,
+  updateVerificationDraft,
+  completeVerification,
 } from './db.js';
 import { solve, verify, computeHash } from './solver.js';
 import {
@@ -22,8 +27,18 @@ import {
   validateTubes,
   validateWeights,
 } from './validate.js';
+import { normalizeEntries, evaluateVerification } from './verification.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+// 乐观锁版本冲突（409）
+class ConflictError extends Error {
+  constructor(message, current) {
+    super(message);
+    this.status = 409;
+    this.current = current;
+  }
+}
 
 export function createApp(db) {
   const app = express();
@@ -46,11 +61,16 @@ export function createApp(db) {
       ...p,
       usable: hash !== null && p.feasible && p.basisHash === hash,
     }));
+    const verifications = listVerifications(db).map((v) => ({
+      ...v,
+      usable: hash !== null && v.publicationFeasible && v.publicationBasisHash === hash,
+    }));
     res.json({
       data,
       currentHash: hash,
       draft,
       publications,
+      verifications,
     });
   });
 
@@ -200,6 +220,161 @@ export function createApp(db) {
     res.json({ ...pub, usable: pub.feasible && pub.basisHash === hash });
   });
 
+  // ---------- 现场装载核验 ----------
+
+  // 附带“发布记录仍可用于当前装载”标记
+  function decorateVerification(v) {
+    if (!v) return null;
+    const hash = currentHash(db);
+    return {
+      ...v,
+      usable: hash !== null && v.publicationFeasible && v.publicationBasisHash === hash,
+    };
+  }
+
+  // 某发布记录的核验（草稿或已冻结结果）
+  app.get('/api/publications/:id/verification', (req, res, next) => {
+    try {
+      const pubId = Number(req.params.id);
+      const pub = getPublication(db, pubId);
+      if (!pub) return res.status(404).json({ error: '发布记录不存在' });
+      const v = decorateVerification(getVerificationByPublication(db, pubId));
+      res.json({ verification: v });
+    } catch (e) {
+      next(e);
+    }
+  });
+
+  // 全部核验记录
+  app.get('/api/verifications', (req, res) => {
+    res.json(listVerifications(db).map((v) => decorateVerification(v)));
+  });
+
+  // 暂存/更新草稿（同一发布记录至多一份；更新须携带版本号）
+  app.put('/api/publications/:id/verification', (req, res, next) => {
+    try {
+      const pubId = Number(req.params.id);
+      const pub = getPublication(db, pubId);
+      if (!pub) return res.status(404).json({ error: '发布记录不存在' });
+      if (!pub.feasible) {
+        throw new ValidationError(['该发布记录不是可行装载图，不能发起核验']);
+      }
+      const hash = currentHash(db);
+      if (hash === null || pub.basisHash !== hash) {
+        throw new ValidationError([
+          '发布记录已不可用于当前装载：录入数据相对冻结快照已变化，请改用与当前数据一致的发布记录',
+        ]);
+      }
+      const entries = normalizeEntries(req.body?.entries, pub.config.holes);
+
+      let created = false;
+      let v;
+      const tx = db.transaction(() => {
+        // 事务内重读发布指纹，拒绝与他人的发布/录入变更竞争
+        const pubNow = getPublication(db, pubId);
+        const hashNow = currentHash(db);
+        if (!pubNow || !pubNow.feasible || hashNow === null || pubNow.basisHash !== hashNow) {
+          throw new ValidationError(['发布记录在保存期间已不可用于当前装载，请刷新后重试']);
+        }
+        const cur = getVerificationByPublication(db, pubId);
+        if (cur && cur.status === 'completed') {
+          throw new ConflictError('该发布记录的核验已完成并冻结，不能再修改', decorateVerification(cur));
+        }
+        if (cur) {
+          const version = Number(req.body?.version);
+          if (!Number.isInteger(version) || version <= 0) {
+            throw new ValidationError(['更新草稿必须携带当前版本号 version']);
+          }
+          if (cur.version !== version) {
+            throw new ConflictError(
+              `版本已过期：你基于的版本为 ${version}，服务器当前版本为 ${cur.version}，请恢复最新草稿后再修改`,
+              decorateVerification(cur),
+            );
+          }
+          if (!updateVerificationDraft(db, cur.id, { version, entries })) {
+            throw new ConflictError('草稿更新失败（版本冲突），请恢复最新草稿后再修改', decorateVerification(cur));
+          }
+          v = getVerificationByPublication(db, pubId);
+        } else {
+          insertVerification(db, { publicationId: pubId, holeCount: pub.config.holes, entries });
+          created = true;
+          v = getVerificationByPublication(db, pubId);
+        }
+      });
+      tx();
+      res.status(created ? 201 : 200).json({
+        ok: true,
+        created,
+        verification: decorateVerification(v),
+      });
+    } catch (e) {
+      next(e);
+    }
+  });
+
+  // 完成核验：同一事务内重读发布快照与当前数据 → 逐项判定 → 冻结结果
+  app.post('/api/publications/:id/verification/complete', (req, res, next) => {
+    try {
+      const pubId = Number(req.params.id);
+      const pub = getPublication(db, pubId);
+      if (!pub) return res.status(404).json({ error: '发布记录不存在' });
+      const existing = getVerificationByPublication(db, pubId);
+      if (!existing) {
+        throw new ValidationError(['尚无核验草稿，请先按孔位录入并暂存']);
+      }
+      if (existing.status === 'completed') {
+        // 幂等：重复完成不生成第二份结果，直接返回已冻结记录
+        return res.json({ ok: true, repeated: true, verification: decorateVerification(existing) });
+      }
+      const version = Number(req.body?.version);
+      if (!Number.isInteger(version) || version <= 0) {
+        throw new ValidationError(['完成核验必须携带草稿当前版本号 version']);
+      }
+
+      let v;
+      const tx = db.transaction(() => {
+        const cur = getVerificationByPublication(db, pubId);
+        if (!cur || cur.status !== 'draft') {
+          throw new ConflictError('核验状态已变化，请刷新后重试', decorateVerification(cur));
+        }
+        if (cur.version !== version) {
+          throw new ConflictError(
+            `版本已过期：你基于的版本为 ${version}，服务器当前版本为 ${cur.version}，请恢复最新草稿后再完成`,
+            decorateVerification(cur),
+          );
+        }
+        // 同一事务内重读：冻结发布快照 + 当前录入数据指纹
+        const pubNow = getPublication(db, pubId);
+        const hashNow = currentHash(db);
+        const entries = normalizeEntries(cur.entries, pubNow.config.holes);
+        const evalResult = evaluateVerification(pubNow, hashNow, entries);
+        if (!evalResult.ok) {
+          // 核验不通过：回滚（草稿保留原状），不生成完成记录
+          throw new ValidationError(evalResult.errors);
+        }
+        const completedAt = new Date().toISOString();
+        const result = {
+          passed: true,
+          publicationId: pubId,
+          publicationBasisHash: pubNow.basisHash,
+          holeCount: pubNow.config.holes,
+          tolerance: pubNow.config.tolerance,
+          entries,
+          details: evalResult.details,
+          completedAt,
+        };
+        if (!completeVerification(db, cur.id, { version, result, completedAt })) {
+          throw new ConflictError('核验完成失败（版本冲突），请刷新后重试', decorateVerification(cur));
+        }
+        v = getVerificationByPublication(db, pubId);
+      });
+      tx();
+      res.status(200).json({ ok: true, verification: decorateVerification(v) });
+    } catch (e) {
+      next(e);
+    }
+  });
+
   // ---------- 静态前端 ----------
 
   app.use(express.static(path.join(__dirname, '..', 'public')));
@@ -209,6 +384,11 @@ export function createApp(db) {
   app.use((err, req, res, next) => {
     if (err instanceof ValidationError) {
       return res.status(400).json({ error: err.message, errors: err.errors });
+    }
+    if (err instanceof ConflictError) {
+      return res
+        .status(409)
+        .json({ error: err.message, errors: [err.message], current: err.current });
     }
     if (err && err.type === 'entity.parse.failed') {
       return res.status(400).json({ error: '请求体不是合法 JSON', errors: ['请求体不是合法 JSON'] });

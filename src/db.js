@@ -63,6 +63,21 @@ CREATE TABLE IF NOT EXISTS publications (
   result_json TEXT NOT NULL,
   reasons TEXT
 );
+
+-- 现场装载核验：同一发布记录至多一份（UNIQUE），草稿可反复暂存（version 乐观锁），
+-- 完成后结果冻结、不可再改。
+CREATE TABLE IF NOT EXISTS verifications (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  publication_id INTEGER NOT NULL UNIQUE REFERENCES publications(id),
+  status TEXT NOT NULL CHECK (status IN ('draft', 'completed')),
+  version INTEGER NOT NULL DEFAULT 1,
+  hole_count INTEGER NOT NULL,
+  entries_json TEXT NOT NULL DEFAULT '[]',
+  result_json TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  completed_at TEXT
+);
 `;
 
 // ---------- 读取 ----------
@@ -165,6 +180,105 @@ export function saveDraft(db, { basisHash, feasible, reasons, result }) {
        result_json = excluded.result_json,
        computed_at = datetime('now')`,
   ).run(basisHash, feasible ? 1 : 0, JSON.stringify(reasons ?? []), JSON.stringify(result));
+}
+
+// ---------- 现场装载核验 ----------
+
+function mapVerification(row) {
+  if (!row) return null;
+  const entries = JSON.parse(row.entries_json);
+  // 冻结图需要现场录入的物件数（空孔无需录入），作为进度分母
+  let requiredCount = null;
+  if (row.pub_result_json) {
+    const arr = JSON.parse(row.pub_result_json).arrangement;
+    requiredCount = Array.isArray(arr) ? arr.filter((s) => s !== null).length : null;
+  }
+  return {
+    id: row.id,
+    publicationId: row.publication_id,
+    status: row.status,
+    version: row.version,
+    holeCount: row.hole_count,
+    entries,
+    filledCount: entries.filter((e) => e.ref !== '').length,
+    requiredCount,
+    result: row.result_json ? JSON.parse(row.result_json) : null,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    completedAt: row.completed_at ?? null,
+  };
+}
+
+// 列表附带发布记录的可行性 / 数据指纹，供调用方标记“仍可用于当前装载”
+export function listVerifications(db) {
+  return db
+    .prepare(
+      `SELECT v.*, p.basis_hash AS pub_basis_hash, p.feasible AS pub_feasible,
+              p.result_json AS pub_result_json
+       FROM verifications v
+       JOIN publications p ON p.id = v.publication_id
+       ORDER BY v.id DESC`,
+    )
+    .all()
+    .map((row) => {
+      const v = mapVerification(row);
+      v.publicationBasisHash = row.pub_basis_hash;
+      v.publicationFeasible = !!row.pub_feasible;
+      return v;
+    });
+}
+
+export function getVerificationByPublication(db, publicationId) {
+  const row = db
+    .prepare(
+      `SELECT v.*, p.basis_hash AS pub_basis_hash, p.feasible AS pub_feasible,
+              p.result_json AS pub_result_json
+       FROM verifications v
+       JOIN publications p ON p.id = v.publication_id
+       WHERE v.publication_id = ?`,
+    )
+    .get(publicationId);
+  if (!row) return null;
+  const v = mapVerification(row);
+  v.publicationBasisHash = row.pub_basis_hash;
+  v.publicationFeasible = !!row.pub_feasible;
+  return v;
+}
+
+// 创建草稿；同一发布记录已存在核验时由 UNIQUE 约束拒绝（不静默覆盖）
+export function insertVerification(db, { publicationId, holeCount, entries }) {
+  const info = db
+    .prepare(
+      `INSERT INTO verifications (publication_id, status, version, hole_count, entries_json)
+       VALUES (?, 'draft', 1, ?, ?)`,
+    )
+    .run(publicationId, holeCount, JSON.stringify(entries));
+  return info.lastInsertRowid;
+}
+
+// 带乐观锁版本的草稿更新；返回 false 表示版本过期（他人已修改）
+export function updateVerificationDraft(db, id, { version, entries }) {
+  const info = db
+    .prepare(
+      `UPDATE verifications
+       SET entries_json = ?, version = version + 1, updated_at = datetime('now')
+       WHERE id = ? AND status = 'draft' AND version = ?`,
+    )
+    .run(JSON.stringify(entries), id, version);
+  return info.changes === 1;
+}
+
+// 完成核验：冻结实测结果；仅当仍为草稿且版本匹配时生效
+export function completeVerification(db, id, { version, result, completedAt }) {
+  const info = db
+    .prepare(
+      `UPDATE verifications
+       SET status = 'completed', version = version + 1,
+           result_json = ?, completed_at = ?, updated_at = datetime('now')
+       WHERE id = ? AND status = 'draft' AND version = ?`,
+    )
+    .run(JSON.stringify(result), completedAt, id, version);
+  return info.changes === 1;
 }
 
 // ---------- 发布（由 server 在单事务内调用） ----------

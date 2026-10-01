@@ -83,6 +83,15 @@
       <h2>5. 已发布装载图</h2>
       <div id="pub-list"></div>
     </section>
+
+    <section class="card" id="sec-verifications">
+      <h2>6. 现场装载核验</h2>
+      <p class="muted">
+        选择一条「✓ 可用于当前装载」的发布记录，按孔位录入实际物件编号与实测质量（空孔保持为空、质量 0）；
+        草稿可暂存恢复，完成时在事务内按冻结图逐项复核，通过后冻结结果。
+      </p>
+      <div id="verification-list"></div>
+    </section>
   </main>
 
   <dialog id="pub-dialog">
@@ -91,6 +100,14 @@
       <button id="pub-close" class="icon-btn">✕</button>
     </div>
     <div id="pub-detail"></div>
+  </dialog>
+
+  <dialog id="verify-dialog">
+    <div class="dialog-head">
+      <h3 id="verify-title"></h3>
+      <button id="verify-close" class="icon-btn">✕</button>
+    </div>
+    <div id="verify-detail"></div>
   </dialog>
 
   <script src="app.js"></script>
